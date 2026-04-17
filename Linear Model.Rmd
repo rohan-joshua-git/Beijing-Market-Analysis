@@ -1,0 +1,288 @@
+---
+title: "Linear Regression for Beijing Housing Prices"
+author: "Rohan"
+date: "2026-03-23"
+output: html_document
+---
+
+# WD and libraries
+```{r setup, include=FALSE}
+setwd("C:/Users/rohan/OneDrive/Desktop/NUS Y1S2/BT2102/Assignment 3")
+library(readxl)
+library(tidyverse)
+library(broom)
+library(car)
+
+# Install ranger if not already installed
+if (!require("ranger", quietly = TRUE)) {
+  install.packages("ranger")
+}
+library(ranger)
+```
+
+# load data
+```{r linearRegression, include=FALSE}
+# Read file
+df <- read_excel("cleaned_beijing_housing.xlsx")
+
+# check data
+head(df)
+str(df)
+
+# Prepare data for linear regression (exclude price_per_sqm)
+model_data <- df %>%
+  select(price, Lng, Lat, DOM, followers, totalPrice, square, livingRoom, 
+         drawingRoom, kitchen, bathRoom, floor_num, buildingType, constructionTime,
+         renovationCondition, buildingStructure, ladderRatio, elevator, 
+         fiveYearsProperty, subway, district, communityAverage, 
+         house_age) %>% 
+  drop_na()
+```
+
+# Model 1: Simple Model
+```{r model1}
+model_simple <- lm(price ~ square + livingRoom + drawingRoom + kitchen + bathRoom + 
+              elevator + subway + floor_num + house_age + renovationCondition + 
+              buildingType + ladderRatio, 
+            data = model_data)
+
+summary(model_simple)
+vif(model_simple)
+```
+
+# Model 2: Stepwise Model
+```{r model2}
+# full model
+model_full <- lm(price ~ Lng + Lat + DOM + followers + totalPrice + square + 
+                   livingRoom + drawingRoom + kitchen + bathRoom + floor_num + 
+                   buildingType + constructionTime + renovationCondition + 
+                   buildingStructure + ladderRatio + elevator + fiveYearsProperty + 
+                   subway + district + communityAverage + house_age, 
+                 data = model_data)
+
+# backward stepwise regression
+model_stepwise <- step(model_full, direction = "backward")
+
+summary(model_stepwise)
+```
+
+# Random Forest Model & Value Score
+```{r random_forest, fig.width=10, fig.height=7}
+# Prepare data for Random Forest (same as linear regression)
+rf_data <- model_data %>%
+  select(price, Lng, Lat, DOM, followers, totalPrice, square, livingRoom, 
+         drawingRoom, kitchen, bathRoom, floor_num, buildingType, constructionTime,
+         renovationCondition, buildingStructure, ladderRatio, elevator, 
+         fiveYearsProperty, subway, district, communityAverage, house_age)
+
+# Build random Forest model
+set.seed(42)
+rf_model <- ranger(price ~ ., 
+                   data = rf_data, 
+                   num.trees = 500, 
+                   importance = 'permutation',
+                   write.forest = TRUE)
+
+# Get importance scores
+importance_scores <- importance(rf_model)
+
+# Create data frame and normalize
+importance_df <- data.frame(
+  feature = names(importance_scores),
+  importance = importance_scores
+) %>%
+  arrange(desc(importance)) %>%
+  mutate(
+    weight = importance / sum(importance),
+    weight_pct = weight * 100
+  )
+
+# Display importance
+cat("\n=== RANDOM FOREST FEATURE IMPORTANCE ===\n")
+print(importance_df)
+
+# Extract weights for VALUE SCORE features only
+value_weights <- importance_df %>%
+  filter(feature %in% c("square", "bathRoom", "kitchen", "elevator")) %>%
+  arrange(desc(weight))
+
+cat("\n=== VALUE SCORE WEIGHTS (DATA-DRIVEN) ===\n")
+print(value_weights)
+
+# Create weight lookup table
+square_weight <- value_weights$weight[value_weights$feature == "square"]
+bathroom_weight <- value_weights$weight[value_weights$feature == "bathRoom"]
+kitchen_weight <- value_weights$weight[value_weights$feature == "kitchen"]
+elevator_weight <- value_weights$weight[value_weights$feature == "elevator"]
+
+# Calculate VALUE SCORE for each property
+rf_data_with_value <- rf_data %>%
+  mutate(
+    value_score = (square * square_weight +
+                   bathRoom * bathroom_weight +
+                   kitchen * kitchen_weight +
+                   elevator * elevator_weight) / communityAverage
+  )
+
+# Rank districts by average value score
+summary_by_district <- rf_data_with_value %>%
+  group_by(district) %>%
+  summarise(
+    avg_value_score = mean(value_score, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    avg_square = mean(square, na.rm = TRUE),
+    count = n()
+  ) %>%
+  arrange(desc(avg_value_score))
+
+cat("\n=== DISTRICTS RANKED BY VALUE SCORE ===\n")
+print(summary_by_district)
+
+# Plot importance
+importance_df %>%
+  ggplot(aes(x = reorder(feature, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "#3B82F6") +
+  coord_flip() +
+  labs(title = "What Drives Beijing Property Prices?",
+       subtitle = "Ranger Random Forest Feature Importance",
+       x = "Feature",
+       y = "Importance Score") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+importance_scores <- importance(rf_model)
+print(importance_scores)
+
+importance_df <- data.frame(
+  feature = names(importance_scores),
+  importance = importance_scores
+) %>%
+  mutate(weight = importance / sum(importance))
+
+print(importance_df)
+
+print(rf_model)
+```
+
+```{r test forest, fig.width=10, fig.height=7}
+# Split data 80/20
+set.seed(42)
+train_indices <- sample(1:nrow(rf_data), 0.8 * nrow(rf_data))
+train_data <- rf_data[train_indices, ]
+test_data <- rf_data[-train_indices, ]
+
+# Train on 80%
+rf_model_train <- ranger(price ~ ., 
+                         data = train_data, 
+                         num.trees = 100, 
+                         importance = 'permutation')
+
+# Test on 20%
+test_predictions <- predict(rf_model_train, test_data)$predictions
+
+# Calculate test R²
+test_ss_res <- sum((test_data$price - test_predictions)^2)
+test_ss_tot <- sum((test_data$price - mean(test_data$price))^2)
+test_r2 <- 1 - (test_ss_res / test_ss_tot)
+train_r2 <- rf_model_train$r.squared
+
+# Display results
+cat("\n=== MODEL VALIDATION ===\n")
+cat("Training R²:", round(train_r2, 4), "\n")
+cat("Test R²:", round(test_r2, 4), "\n")
+cat("Difference (overfitting check):", round(train_r2 - test_r2, 4), "\n")
+
+if (test_r2 > 0.90) {
+  cat("\n✅ EXCELLENT: Model generalizes well to unseen data\n")
+} else if (test_r2 > 0.80) {
+  cat("\n✅ GOOD: Model performs well with minor overfitting\n")
+} else if (test_r2 > 0.70) {
+  cat("\n⚠️ WARNING: Significant overfitting detected\n")
+} else {
+  cat("\n❌ PROBLEM: Model is severely overfit\n")
+}
+```
+
+# Key Insights & Explanations
+```{r insights}
+cat("
+=== TOP PRICE DRIVERS (Linear Regression) ===
+
+1. totalPrice (+80.89 CNY per unit) - STRONGEST
+   Transaction value dominates pricing
+
+2. communityAverage (+0.27 CNY per unit) - VERY STRONG
+   Market baseline/neighborhood matters
+
+3. renovationCondition (+1,084 CNY) - VERY STRONG
+   Better renovation = higher price
+
+4. Lat (Latitude: +3,341 CNY)
+   North-south location significantly affects price
+
+5. bathRoom (+1,540 CNY per bathroom)
+   More bathrooms = more expensive
+
+6. kitchen (+1,470 CNY per kitchen)
+   Kitchens add value
+
+7. DOM (+16.93 CNY per day)
+   Faster sales = higher perceived value
+
+8. followers (+22.16 CNY per follower)
+   Buyer interest indicates desirability
+
+9. Lng (Longitude: -1,451 CNY)
+   East-west location has negative effect
+
+10. elevator (+758.6 CNY)
+    Elevator access adds value
+
+=== COUNTERINTUITIVE FINDINGS ===
+
+1. square (-434.8 CNY per sqm) - NEGATIVE (confounded)
+   BUT Random Forest shows square is 2nd most important!
+   Explanation: Linear regression coefficient is negative when 
+   controlling for totalPrice + communityAverage (confounding).
+   Random Forest correctly identifies size as critical for prediction.
+   
+2. floor_num (-69.36 CNY per floor) - UNEXPECTED
+   Higher floors slightly decrease price (cultural preference 
+   for ground floor in China for family practicality)
+
+3. constructionTime (-72.05 CNY per year) - REVERSED
+   Older buildings add value (established neighborhoods)
+   New construction clustered in speculative zones
+
+4. buildingType (-384.4 CNY) & buildingStructure (-525 CNY)
+   Different types command different premiums
+
+5. fiveYearsProperty (-1,610 CNY) - OLDER OWNERS = LOWER PRICE
+   Early speculators from bubble era selling at losses
+
+=== MODEL QUALITY ===
+
+Linear Regression R² = 0.853 (explains 85.3% of variation)
+Random Forest Validation: Confirms top drivers identified
+
+CONCLUSION: Beijing property prices are fundamentally driven by:
+- Market tier (totalPrice, communityAverage)
+- Practical amenities (bathrooms, kitchens, elevators)
+- Property condition (renovation quality)
+- Location (latitude/longitude)
+")
+
+```
+
+```{r new csv}
+# 1. Generate LR Predictions (using your stepwise model)
+df$LR_Pred <- predict(model_stepwise, df)
+
+# 2. Generate RF Predictions (using your ranger model)
+# Note: ranger requires a specific way to call predictions
+rf_predictions_obj <- predict(rf_model, df)
+df$RF_Pred <- rf_predictions_obj$predictions
+
+# 3. Export to a temporary CSV
+write.csv(df %>% select(LR_Pred, RF_Pred), "predictions_export.csv", row.names = FALSE)
+```
